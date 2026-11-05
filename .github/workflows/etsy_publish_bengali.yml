@@ -1,0 +1,182 @@
+name: Publish Bengali Cookbooks to Etsy
+
+on:
+  workflow_dispatch:
+    inputs:
+      auth_code:
+        description: >
+          Etsy OAuth authorization code — paste the `code=` value from the redirect URL
+          (e.g. z1Jb7Lvv…). Leave blank if ETSY_ACCESS_TOKEN secret is already set and valid.
+        required: false
+        default: ""
+      books:
+        description: >
+          Space-separated list of book slugs to publish, e.g.
+          "Dhokar_Dalna_FINAL Kumro_Chhokka_FINAL".
+          Leave blank to publish ALL remaining books + bundle.
+        required: false
+        default: ""
+      publish_bundle:
+        description: "Also publish the 10-book bundle? (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      ETSY_API_KEY: "y57ja1ukj1s3yn3q05crjjjt"
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # ── 3. Exchange auth code for access token (if provided) ───────────────
+      - name: Exchange OAuth code for access token
+        id: get_token
+        if: ${{ inputs.auth_code != '' }}
+        env:
+          AUTH_CODE:     ${{ inputs.auth_code }}
+          CODE_VERIFIER: ${{ secrets.ETSY_CODE_VERIFIER }}
+          REDIRECT_URI:  "https://localhost"
+        run: |
+          python - <<'PYEOF'
+          import os, json, requests, sys
+
+          api_key       = os.environ["ETSY_API_KEY"]
+          auth_code     = os.environ["AUTH_CODE"]
+          code_verifier = os.environ.get("CODE_VERIFIER", "")
+          redirect_uri  = os.environ["REDIRECT_URI"]
+
+          if not code_verifier:
+              print("ERROR: ETSY_CODE_VERIFIER secret is not set.")
+              print("Add it in GitHub → Settings → Secrets → Actions.")
+              sys.exit(1)
+
+          r = requests.post(
+              "https://api.etsy.com/v3/public/oauth/token",
+              data={
+                  "grant_type":    "authorization_code",
+                  "client_id":     api_key,
+                  "redirect_uri":  redirect_uri,
+                  "code":          auth_code,
+                  "code_verifier": code_verifier,
+              },
+          )
+          if not r.ok:
+              print(f"Token exchange failed: {r.status_code} {r.text}")
+              sys.exit(1)
+
+          data = r.json()
+          print(f"access_token_length={len(data['access_token'])}")
+          print(f"refresh_token_length={len(data.get('refresh_token', ''))}")
+          # Write to env file for subsequent steps
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ETSY_ACCESS_TOKEN={data['access_token']}\n")
+              if data.get("refresh_token"):
+                  f.write(f"ETSY_REFRESH_TOKEN={data['refresh_token']}\n")
+
+          print("Token exchange SUCCESS ✓")
+          print("⚠️  Save the refresh token as secret ETSY_REFRESH_TOKEN for future runs.")
+          PYEOF
+
+      # ── 4. Use stored token if no auth_code supplied ───────────────────────
+      - name: Use stored access token
+        if: ${{ inputs.auth_code == '' }}
+        env:
+          STORED_TOKEN: ${{ secrets.ETSY_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$STORED_TOKEN" ]; then
+            echo "ERROR: No auth_code provided and ETSY_ACCESS_TOKEN secret is not set."
+            echo "Either provide an auth_code when triggering the workflow,"
+            echo "or add ETSY_ACCESS_TOKEN to your GitHub Secrets."
+            exit 1
+          fi
+          echo "ETSY_ACCESS_TOKEN=$STORED_TOKEN" >> "$GITHUB_ENV"
+
+      # ── 5. Optionally refresh token (if access token expired) ──────────────
+      - name: Refresh access token if needed
+        id: maybe_refresh
+        env:
+          REFRESH_TOKEN: ${{ secrets.ETSY_REFRESH_TOKEN }}
+        run: |
+          # Quick ping to test token validity
+          python - <<'PYEOF'
+          import os, requests, sys
+
+          token   = os.environ.get("ETSY_ACCESS_TOKEN", "")
+          api_key = os.environ["ETSY_API_KEY"]
+          refresh = os.environ.get("REFRESH_TOKEN", "")
+
+          if not token:
+              sys.exit(0)   # handled by step 4
+
+          # Test ping
+          r = requests.get(
+              "https://openapi.etsy.com/v3/application/openapi-ping",
+              headers={"x-api-key": api_key, "Authorization": f"Bearer {token}"},
+          )
+          if r.ok:
+              print("Access token is valid ✓")
+              sys.exit(0)
+
+          if not refresh:
+              print("Access token invalid and no refresh token stored.")
+              print("Please re-run the workflow with a fresh auth_code.")
+              sys.exit(1)
+
+          print(f"Access token expired ({r.status_code}). Refreshing…")
+          r2 = requests.post(
+              "https://api.etsy.com/v3/public/oauth/token",
+              data={
+                  "grant_type":    "refresh_token",
+                  "client_id":     api_key,
+                  "refresh_token": refresh,
+              },
+          )
+          if not r2.ok:
+              print(f"Refresh failed: {r2.status_code} {r2.text}")
+              sys.exit(1)
+
+          data = r2.json()
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ETSY_ACCESS_TOKEN={data['access_token']}\n")
+              if data.get("refresh_token"):
+                  f.write(f"ETSY_REFRESH_TOKEN={data['refresh_token']}\n")
+          print("Token refreshed ✓")
+          PYEOF
+
+      # ── 6. Build CLI args ──────────────────────────────────────────────────
+      - name: Build publish arguments
+        id: build_args
+        run: |
+          BOOKS_INPUT="${{ inputs.books }}"
+          BUNDLE_INPUT="${{ inputs.publish_bundle }}"
+          ARGS=""
+          if [ -n "$BOOKS_INPUT" ]; then
+            ARGS="$BOOKS_INPUT"
+          fi
+          if [ "$BUNDLE_INPUT" = "true" ]; then
+            ARGS="$ARGS --bundle"
+          fi
+          echo "PUBLISH_ARGS=$ARGS" >> "$GITHUB_ENV"
+
+      # ── 7. Publish listings ────────────────────────────────────────────────
+      - name: Publish Bengali cookbook listings
+        working-directory: Bengali
+        run: |
+          if [ -z "$PUBLISH_ARGS" ]; then
+            python etsy_publish_bengali.py
+          else
+            python etsy_publish_bengali.py $PUBLISH_ARGS
+          fi
